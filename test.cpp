@@ -1,6 +1,8 @@
 #include "SDL_audio.h"
 #include "SDL_error.h"
 #include "SDL_pixels.h"
+#include "SDL_stdinc.h"
+#include "SDL_timer.h"
 #include "header/AudioBuffer.h"
 #include "header/FrameQueue.h"
 #include <SDL2/SDL.h>
@@ -279,13 +281,12 @@ int main(int argc, char *argv[]) {
     } else {
       break;
     }
-    if (diff <= -0.04) {
+    if (diff <= -0.05) {
       av_frame_free(&frame);
       continue;
-    } else if (diff >= 0.04) {
-      std::this_thread::sleep_for(
-          std::chrono::duration_cast<std::chrono::seconds>(
-              std::chrono::duration<double>(diff)));
+    }
+    if (diff >= 0.005) {
+      SDL_Delay(static_cast<Uint32>(diff * 1000 * 0.8));
     }
     SDL_RenderClear(render);
     SDL_RenderCopy(render, texture, nullptr, nullptr);
