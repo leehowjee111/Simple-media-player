@@ -250,12 +250,13 @@ void Player::render() {
         break;
       }
       case SDL_MOUSEBUTTONDOWN: {
-        std::string btn_name = "";
+
         if (event_.button.button == SDL_BUTTON_LEFT) {
-          btn_name = "鼠标左键";
-        }
-        if (event_.button.button == SDL_BUTTON_RIGHT) {
-          btn_name = "鼠标右键";
+          if (event_.button.y >= height_) {
+            double ratio = event_.button.x * 1.0 / width_;
+            double pos = ratio * demuxer_.get_duration();
+            seek(pos);
+          }
         }
         break;
       }
@@ -296,14 +297,14 @@ void Player::render() {
                          frame->linesize[2]);
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
-    // SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
-    // SDL_Rect back_rect{0, height_, width_, 15};
-    // SDL_RenderFillRect(renderer_, &back_rect);
-    // SDL_SetRenderDrawColor(render_, 255, 255, 255, 255);
-    // SDL_Rect front_rect{
-    //     0, height, static_cast<int>((current_seconds / total_seconds) *
-    //     width), 15};
-    // SDL_RenderFillRect(renderer_, &front_rect);
+    SDL_SetRenderDrawColor(renderer_, 80, 80, 80, 255);
+    SDL_Rect back_rect{0, height_, width_, 15};
+    SDL_RenderFillRect(renderer_, &back_rect);
+    SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 255);
+    double duration = demuxer_.get_duration();
+    SDL_Rect front_rect{
+        0, height_, static_cast<int>((audio_clock / duration) * width_), 15};
+    SDL_RenderFillRect(renderer_, &front_rect);
     SDL_Rect video_rect{0, 0, width_, height_};
     SDL_RenderCopy(renderer_, texture_, nullptr, &video_rect);
     SDL_RenderPresent(renderer_);
