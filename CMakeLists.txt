@@ -15,9 +15,15 @@ pkg_check_modules(FFMPEG REQUIRED
                   libswresample
                   )
 pkg_check_modules(SDL2 REQUIRED sdl2)
-add_executable(SDL2_test test.cpp
+add_executable(SDL2_test main.cpp
                         src/FrameQueue.cpp
-                        src/AudioQueue.cpp)
+                        src/AudioBuffer.cpp
+                        src/demuxer.cpp
+                        src/player.cpp
+                        src/video_codec.cpp
+                        src/audio_codec.cpp
+                        src/AudioPacket.cpp
+                        src/FramePacket.cpp)
 
 target_link_libraries(SDL2_test PRIVATE ${FFMPEG_LIBRARIES} ${SDL2_LIBRARIES})
 target_include_directories(SDL2_test PRIVATE ${FFMPEG_INCLUDE_DIRS}

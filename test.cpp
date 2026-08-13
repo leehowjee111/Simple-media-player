@@ -1,6 +1,7 @@
 #include "SDL_audio.h"
 #include "SDL_error.h"
 #include "SDL_pixels.h"
+#include "SDL_rect.h"
 #include "SDL_stdinc.h"
 #include "SDL_timer.h"
 #include "header/AudioBuffer.h"
@@ -11,12 +12,11 @@
 #include <SDL2/SDL_mouse.h>
 #include <SDL2/SDL_render.h>
 #include <SDL2/SDL_video.h>
+#include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <libavutil/channel_layout.h>
-#include <libavutil/frame.h>
 #include <libavutil/rational.h>
 #include <thread>
 #include <vector>
@@ -31,7 +31,9 @@ extern "C" {
 #include <string>
 using std::cerr;
 using std::cout;
-
+std::atomic<bool> seek{false};
+std::atomic<int64_t> target_seconds{0};
+std::atomic<bool> need_audio_reset_clock{false};
 void decode_thread(AVFormatContext *fmt_ctx, SwrContext *swr_ctx,
                    AVCodecContext *video_codec_ctx,
                    AVCodecContext *audio_codec_ctx, int video_stream_index,
@@ -41,6 +43,24 @@ void decode_thread(AVFormatContext *fmt_ctx, SwrContext *swr_ctx,
   AVPacket *pkt = av_packet_alloc();
   uint8_t *out_data[1] = {nullptr};
   while (av_read_frame(fmt_ctx, pkt) >= 0) {
+    if (seek == true) {
+      int64_t time_stamp =
+          target_seconds /
+          av_q2d(fmt_ctx->streams[video_stream_index]->time_base);
+      av_seek_frame(fmt_ctx, video_stream_index, time_stamp,
+                    AVSEEK_FLAG_BACKWARD);
+      if (audio_codec_ctx) {
+        avcodec_flush_buffers(audio_codec_ctx);
+      }
+      avcodec_flush_buffers(video_codec_ctx);
+      audio_b.clear();
+      frame_q.clear();
+      audio_b.reset_clock(static_cast<int>(target_seconds * obtained.freq));
+      need_audio_reset_clock = true;
+      seek = false;
+      av_packet_unref(pkt);
+      continue;
+    }
     if (pkt->stream_index == video_stream_index) {
       int ret = avcodec_send_packet(video_codec_ctx, pkt);
       if (ret < 0) {
@@ -70,6 +90,13 @@ void decode_thread(AVFormatContext *fmt_ctx, SwrContext *swr_ctx,
           } else if (ret < 0) {
             cerr << "audio_avcodec_receive_frame error\n";
             break;
+          }
+          if (need_audio_reset_clock == true) {
+            double real_pts =
+                frame->pts *
+                av_q2d(fmt_ctx->streams[audio_stream_index]->time_base);
+            audio_b.reset_clock(static_cast<int>(real_pts * obtained.freq));
+            need_audio_reset_clock = false;
           }
           out_data[0] = nullptr;
           int out_samples = av_rescale_rnd(
@@ -112,6 +139,13 @@ void decode_thread(AVFormatContext *fmt_ctx, SwrContext *swr_ctx,
         cerr << "audio_avcodec_receive_frame error\n";
         break;
       }
+      if (need_audio_reset_clock == true) {
+        double real_pts =
+            frame->pts *
+            av_q2d(fmt_ctx->streams[audio_stream_index]->time_base);
+        audio_b.reset_clock(static_cast<int>(real_pts * obtained.freq));
+        need_audio_reset_clock = false;
+      }
       out_data[0] = nullptr;
       int out_samples = av_rescale_rnd(
           swr_get_delay(swr_ctx, audio_codec_ctx->sample_rate) +
@@ -134,6 +168,13 @@ void audio_callback(void *userdata, uint8_t *stream, int len) {
   AudioBuffer *buf = static_cast<AudioBuffer *>(userdata);
   memset(stream, 0, len);
   buf->read(stream, len);
+}
+std::string format_time(int64_t seconds) {
+  int min = seconds / 60;
+  int sec = seconds % 60;
+  char ftime[6];
+  snprintf(ftime, 6, "%02d:%02d", min, sec);
+  return std::string(ftime);
 }
 int main(int argc, char *argv[]) {
   /*--------------------音视频资源解码部分------------------------*/
@@ -185,6 +226,8 @@ int main(int argc, char *argv[]) {
   AudioBuffer audio_buf;
   SDL_AudioSpec wanted, obtained;
   AVChannelLayout out_ch_layout;
+  int64_t total_seconds = fmt_ctx->duration / AV_TIME_BASE;
+  std::string total_time = format_time(total_seconds);
   if (audio_stream_index >= 0) {
     auto audio_codecpar = fmt_ctx->streams[audio_stream_index]->codecpar;
     const AVCodec *audio_codec = avcodec_find_decoder(audio_codecpar->codec_id);
@@ -218,7 +261,7 @@ int main(int argc, char *argv[]) {
 
   SDL_Window *window =
       SDL_CreateWindow("MyPlay", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                       width, height, 0);
+                       width, height + 15, 0);
   if (!window) {
     cerr << "window is null\n";
     return 1;
@@ -229,10 +272,12 @@ int main(int argc, char *argv[]) {
   std::thread t(decode_thread, fmt_ctx, swr_ctx, video_codec_ctx,
                 audio_codec_ctx, video_stream_index, audio_stream_index,
                 std::ref(fq), std::ref(audio_buf), std::ref(obtained));
-  if (audio_stream_index >= 0) {
-    SDL_PauseAudioDevice(audio_dev, 0);
-  }
+  std::string current_time{};
+  std::string title{};
+  double current_seconds = 0;
   bool running = true;
+  bool paused = false;
+  bool unpauseable = true;
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_int_distribution<> dist(0, 255);
@@ -251,6 +296,18 @@ int main(int argc, char *argv[]) {
         if (event.key.keysym.sym == SDLK_ESCAPE) {
           running = false;
         }
+        if (event.key.keysym.sym == SDLK_SPACE) {
+          paused ^= true;
+        }
+        if (event.key.keysym.sym == SDLK_LEFT) {
+          seek = true;
+          target_seconds =
+              ((current_seconds - 1) > 0 ? current_seconds - 1 : 0);
+        }
+        if (event.key.keysym.sym == SDLK_RIGHT) {
+          seek = true;
+          target_seconds = current_seconds + 1;
+        }
         break;
       }
       case SDL_MOUSEBUTTONDOWN: {
@@ -263,35 +320,77 @@ int main(int argc, char *argv[]) {
         }
         cout << event.button.x << " " << event.button.y << " " << btn_name
              << "\n";
+        if (event.button.y > height) {
+          double ratio = event.button.x * 1.0 / width;
+          target_seconds = ratio * total_seconds;
+          seek = true;
+        }
         break;
       }
       default:
         break;
       }
     }
+    if (audio_stream_index >= 0) {
+      if (paused) {
+        if (!unpauseable) {
+          SDL_PauseAudioDevice(audio_dev, 1);
+          unpauseable = true;
+        }
+        continue;
+      }
+      if (unpauseable) {
+        SDL_PauseAudioDevice(audio_dev, 0);
+        unpauseable = false;
+      }
+    } else {
+      if (paused) {
+        continue;
+      }
+    }
     double diff = 0;
     auto frame = fq.pop();
     if (frame) {
+      current_seconds =
+          frame->pts * av_q2d(fmt_ctx->streams[video_stream_index]->time_base);
+      if (current_seconds < target_seconds - 0.1) {
+        av_frame_free(&frame);
+        continue;
+      }
       diff =
           frame->pts * av_q2d(fmt_ctx->streams[video_stream_index]->time_base) -
           static_cast<double>(audio_buf.total_samples_read()) / obtained.freq;
+      if (diff <= -0.05) {
+        av_frame_free(&frame);
+        continue;
+      }
+      if (diff >= 0.005) {
+        SDL_Delay(static_cast<Uint32>(diff * 1000 * 0.8));
+      }
+      current_time = format_time(current_seconds);
+      title = "MyPlay - " + current_time + " / " + total_time;
+      SDL_SetWindowTitle(window, title.data());
       SDL_UpdateYUVTexture(texture, nullptr, frame->data[0], frame->linesize[0],
                            frame->data[1], frame->linesize[1], frame->data[2],
                            frame->linesize[2]);
-    } else {
-      break;
-    }
-    if (diff <= -0.05) {
+      SDL_SetRenderDrawColor(render, 0, 0, 0, 255);
+      SDL_RenderClear(render);
+      SDL_SetRenderDrawColor(render, 80, 80, 80, 255);
+      SDL_Rect back_rect{0, height, width, 15};
+      SDL_RenderFillRect(render, &back_rect);
+      SDL_SetRenderDrawColor(render, 255, 255, 255, 255);
+      SDL_Rect front_rect{
+          0, height,
+          static_cast<int>((current_seconds / total_seconds) * width), 15};
+      SDL_RenderFillRect(render, &front_rect);
+      SDL_Rect video_rect{0, 0, width, height};
+      SDL_RenderCopy(render, texture, nullptr, &video_rect);
+      SDL_RenderPresent(render);
       av_frame_free(&frame);
+    } else {
+      SDL_Delay(10);
       continue;
     }
-    if (diff >= 0.005) {
-      SDL_Delay(static_cast<Uint32>(diff * 1000 * 0.8));
-    }
-    SDL_RenderClear(render);
-    SDL_RenderCopy(render, texture, nullptr, nullptr);
-    SDL_RenderPresent(render);
-    av_frame_free(&frame);
   }
   cout << "结束\n";
   fq.stop();

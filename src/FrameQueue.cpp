@@ -1,4 +1,5 @@
 #include "../header/FrameQueue.h"
+#include <chrono>
 FrameQueue::~FrameQueue() {
   while (!queue_.empty()) {
     auto frame = queue_.front();
@@ -27,9 +28,31 @@ AVFrame *FrameQueue::pop() {
   pro_condition_.notify_one();
   return frame;
 }
+AVFrame *FrameQueue::pop_timeout(int ms) {
+  std::unique_lock<std::mutex> locker(mtx_);
+  con_condition_.wait_for(locker, std::chrono::milliseconds(ms),
+                          [this]() { return !queue_.empty() || stopped_; });
+  if (queue_.empty()) {
+    return nullptr; // 超时(队列暂时为空)或已停止
+  }
+  auto frame = std::move(queue_.front());
+  queue_.pop();
+  pro_condition_.notify_one();
+  return frame;
+}
 void FrameQueue::stop() {
   std::lock_guard<std::mutex> locker(mtx_);
   stopped_ = true;
+  pro_condition_.notify_all();
+  con_condition_.notify_all();
+}
+void FrameQueue::clear() {
+  std::lock_guard<std::mutex> locker(mtx_);
+  while (!queue_.empty()) {
+    auto frame = queue_.front();
+    queue_.pop();
+    av_frame_free(&frame);
+  }
   pro_condition_.notify_all();
   con_condition_.notify_all();
 }
